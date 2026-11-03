@@ -1,0 +1,23 @@
+[package]
+name = "originchaindb"
+version = "1.0.0-rc.1"
+edition = "2021"
+rust-version = "1.88"
+description = "The official asynchronous OriginChainDB client for Rust"
+license = "MIT"
+repository = "https://github.com/originchaindb/originchaindb-rust"
+homepage = "https://originchaindb.com"
+documentation = "https://docs.rs/originchaindb"
+keywords = ["database", "sql", "vector", "graph", "originchaindb"]
+categories = ["database"]
+readme = "README.md"
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+percent-encoding = "2"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
