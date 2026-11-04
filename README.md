@@ -23,9 +23,10 @@ Create an application with `cargo new myapp`, then add these entries to the
 
 ```toml
 [dependencies]
-originchaindb = { git = "https://github.com/originchaindb/originchaindb-rust", rev = "517e1bdfc073dba7ec2e95ca29a60e7ac5ef9eb6" }
+originchaindb = { git = "https://github.com/originchaindb/originchaindb-rust", rev = "600e5ad1fb46f42da28f2c984bbcbce7eabf29fd" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
+futures-util = "0.3"
 ```
 
 The client is asynchronous and uses Reqwest with Rustls for HTTPS.
@@ -246,6 +247,26 @@ The graph namespace also supports breadth-first traversal and Cypher queries.
 Cypher parameters bind **by name**; SQL parameters bind **by position**.
 See the [API guide](docs/api.md) and source links below for exact signatures.
 
+## Bulk writes and paginated reads
+
+For larger datasets, `write_batches` sends bounded batches and yields an acknowledgment
+for each input range. `scan` reads rows lazily in ordered pages; `pages` also
+exposes a continuation value for resumable processing. These operations use the
+same limits and failure rules across all SDKs.
+
+```rust
+let mut batches = Box::pin(db.rows().write_batches(schema, rows,
+    BatchOptions { batch_size: 2, ..Default::default() }));
+while let Some(batch) = batches.try_next().await? {
+    println!("{} {} {}", batch.offset, batch.count, batch.inserted);
+}
+```
+
+This excerpt uses `db`, `schema` and the lazy `rows` producer from the
+[complete example](examples/bulk_and_scan.rs). See the [bulk and pagination guide](docs/bulk-and-pagination.md)
+for setup, reads, checkpoints, cancellation and recovery. Failed writes are never
+replayed automatically; paginated reads require a unique immutable string key.
+
 ## Understanding SQL results
 
 Rows are `Vec<Map<String, Value>>`; arbitrary-precision JSON numbers are retained. SQL returns a result object rather than only an array:
@@ -375,3 +396,5 @@ requirements are listed at the top. Live examples use your selected database.
 Read [Contributing](CONTRIBUTING.md) before sending a change. Report bugs through
 [GitHub issues](https://github.com/originchaindb/originchaindb-rust/issues); report security concerns
 privately as described in [Security](SECURITY.md). See [LICENSE](LICENSE) for MIT terms.
+
+See [quality and build verification](docs/quality.md) for benchmarks, API compatibility checks, package installation checks and signed build provenance.
