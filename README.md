@@ -23,7 +23,7 @@ Create an application with `cargo new myapp`, then add these entries to the
 
 ```toml
 [dependencies]
-originchaindb = { git = "https://github.com/originchaindb/originchaindb-rust", rev = "fb0dc4964efd92cef711148b27c9d5020a1500f9" }
+originchaindb = { git = "https://github.com/originchaindb/originchaindb-rust", rev = "517e1bdfc073dba7ec2e95ca29a60e7ac5ef9eb6" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
