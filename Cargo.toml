@@ -13,11 +13,14 @@ categories = ["database"]
 readme = "README.md"
 
 [dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 percent-encoding = "2"
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

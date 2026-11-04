@@ -4,6 +4,8 @@
 //! No operation is replayed automatically.
 
 mod integration;
+mod iteration;
+pub use iteration::{BatchOptions, BatchResult, BatchWriteError, PageOptions, RowPage};
 mod resources;
 mod search;
 mod vector;
