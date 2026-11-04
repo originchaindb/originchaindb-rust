@@ -3,9 +3,12 @@
 //! future stops waiting locally; it does not prove a database write was canceled.
 //! No operation is replayed automatically.
 
+mod integration;
 mod resources;
 mod search;
 mod vector;
+use integration::{Observer, RequestSpan, TokenProvider};
+pub use integration::{RequestEvent, RowDecodeError};
 use reqwest::{Method, Url};
 pub use resources::{
     Fts, FtsSearchOptions, Graph, Rows, Schemas, Sql, Vector, VectorSearchOptions,
@@ -27,6 +30,9 @@ pub struct Client {
 struct Inner {
     url: String,
     token: String,
+    provider: Option<TokenProvider>,
+    observer: Option<Observer>,
+    timeout: Duration,
     http: reqwest::Client,
     limit: tokio::sync::Semaphore,
 }
@@ -42,8 +48,34 @@ pub struct ClientBuilder {
     token: String,
     timeout: Duration,
     max_in_flight: usize,
+    provider: Option<TokenProvider>,
+    observer: Option<Observer>,
+    http_builder: Option<reqwest::ClientBuilder>,
 }
 impl ClientBuilder {
+    /// Resolve a fresh token once per request. The future is covered by the
+    /// request deadline and is dropped on cancellation. No auth failure is replayed.
+    pub fn token_provider<F, Fut>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String, Error>> + Send + 'static,
+    {
+        self.token.clear();
+        self.provider = Some(Arc::new(move || Box::pin(provider())));
+        self
+    }
+    /// Receive local, redacted transport metadata. Keep this callback short and
+    /// nonblocking. Panics from the observer do not change the database result.
+    pub fn on_request(mut self, observer: impl Fn(RequestEvent) + Send + Sync + 'static) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+    /// Configure application TLS roots, proxy and HTTP settings. The SDK applies
+    /// its timeout, redirect refusal and user agent when building the client.
+    pub fn http_client_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.http_builder = Some(builder);
+        self
+    }
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -53,13 +85,18 @@ impl ClientBuilder {
         self
     }
     pub fn build(self) -> Result<Client, Error> {
-        validate(&self.url, &self.token)?;
+        validate_url(&self.url)?;
+        if self.provider.is_none() {
+            validate_token(&self.token)?;
+        }
         if self.timeout.is_zero() || self.max_in_flight == 0 {
             return Err(Error::Configuration(
                 "timeout and max_in_flight must be positive",
             ));
         }
-        let http = reqwest::Client::builder()
+        let http = self
+            .http_builder
+            .unwrap_or_default()
             .timeout(self.timeout)
             .connect_timeout(self.timeout.min(Duration::from_secs(10)))
             .redirect(reqwest::redirect::Policy::none())
@@ -71,6 +108,9 @@ impl ClientBuilder {
             inner: Arc::new(Inner {
                 url: self.url.trim_end_matches('/').to_owned(),
                 token: self.token,
+                provider: self.provider,
+                observer: self.observer,
+                timeout: self.timeout,
                 http,
                 limit: tokio::sync::Semaphore::new(self.max_in_flight),
             }),
@@ -78,7 +118,7 @@ impl ClientBuilder {
     }
 }
 
-fn validate(address: &str, token: &str) -> Result<(), Error> {
+fn validate_url(address: &str) -> Result<(), Error> {
     let url = Url::parse(address).map_err(|_| Error::Configuration("invalid database URL"))?;
     let host = url
         .host_str()
@@ -99,6 +139,10 @@ fn validate(address: &str, token: &str) -> Result<(), Error> {
             "use an HTTPS database URL copied from Connect; HTTP is only allowed on loopback",
         ));
     }
+    Ok(())
+}
+
+fn validate_token(token: &str) -> Result<(), Error> {
     if token.is_empty() || token.bytes().any(|c| !(33..127).contains(&c)) {
         return Err(Error::Configuration(
             "token must be nonempty printable ASCII without spaces",
@@ -114,10 +158,21 @@ impl Client {
             token: token.into(),
             timeout: Duration::from_secs(60),
             max_in_flight: 100,
+            provider: None,
+            observer: None,
+            http_builder: None,
         }
     }
     pub fn new(url: impl Into<String>, token: impl Into<String>) -> Result<Self, Error> {
         Self::builder(url, token).build()
+    }
+    /// Start a builder with asynchronously resolved credentials.
+    pub fn builder_with_token_provider<F, Fut>(url: impl Into<String>, provider: F) -> ClientBuilder
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String, Error>> + Send + 'static,
+    {
+        Self::builder(url, "").token_provider(provider)
     }
     pub fn from_env() -> Result<Self, Error> {
         Self::new(
@@ -173,17 +228,45 @@ impl Client {
         body: Option<Value>,
         text: Option<&str>,
     ) -> Result<Value, Error> {
+        let mut span = RequestSpan::new(method.as_str(), path, self.inner.observer.clone());
+        let result = tokio::time::timeout(
+            self.inner.timeout,
+            self.request_inner(method, path, query, body, text, &mut span.event),
+        )
+        .await
+        .unwrap_or(Err(Error::Timeout));
+        span.event.error_kind = result.as_ref().err().map(|error| error.kind().to_owned());
+        span.finished = true;
+        result
+    }
+
+    async fn request_inner(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+        text: Option<&str>,
+        event: &mut RequestEvent,
+    ) -> Result<Value, Error> {
         let _permit = self
             .inner
             .limit
             .acquire()
             .await
             .map_err(|_| Error::Protocol("client closed"))?;
+        let token = if let Some(provider) = &self.inner.provider {
+            let token = provider().await.map_err(|_| Error::Credential)?;
+            validate_token(&token).map_err(|_| Error::Credential)?;
+            token
+        } else {
+            self.inner.token.clone()
+        };
         let mut request = self
             .inner
             .http
             .request(method, format!("{}/{path}", self.inner.url))
-            .bearer_auth(&self.inner.token)
+            .bearer_auth(token)
             .header("Accept", "application/json")
             .query(query);
         if let Some(body) = body {
@@ -196,6 +279,7 @@ impl Client {
         }
         let mut response = request.send().await.map_err(Error::Transport)?;
         let status = response.status().as_u16();
+        event.status = Some(status);
         let header = |name| {
             response
                 .headers()
@@ -204,6 +288,7 @@ impl Client {
                 .map(str::to_owned)
         };
         let request_id = header("X-OC-Request-Id");
+        event.request_id = request_id.clone();
         let retry_after = header("Retry-After");
         let is_text = header("Content-Type").is_some_and(|s| s.starts_with("text/"));
         let mut bytes = Vec::new();
@@ -239,6 +324,8 @@ impl Client {
 /// Typed failure. Display excludes payloads and tokens; inspect fields explicitly.
 #[derive(Debug)]
 pub enum Error {
+    Credential,
+    Timeout,
     Configuration(&'static str),
     Transport(reqwest::Error),
     Protocol(&'static str),
@@ -253,6 +340,22 @@ pub enum Error {
     },
 }
 impl Error {
+    /// Stable category for application policy and redacted diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::Timeout => "timeout",
+            Self::Configuration(_) => "configuration",
+            Self::Transport(error) if error.is_timeout() => "timeout",
+            Self::Transport(_) => "transport",
+            Self::Protocol(_) => "protocol",
+            Self::Http { status: 401, .. } => "authentication",
+            Self::Http { status: 403, .. } => "permission",
+            Self::Http { status: 429, .. } => "rate_limit",
+            Self::Http { .. } => "http",
+            Self::Batch { .. } => "batch",
+        }
+    }
     pub fn status(&self) -> Option<u16> {
         match self {
             Self::Http { status, .. } => Some(*status),
@@ -261,12 +364,16 @@ impl Error {
         }
     }
     pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::Transport(e) if e.is_timeout())
+        matches!(self, Self::Timeout) || matches!(self, Self::Transport(e) if e.is_timeout())
     }
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Credential => f.write_str("OriginChainDB credential provider failed"),
+            Self::Timeout => {
+                f.write_str("OriginChainDB request timed out; write outcome may be unknown")
+            }
             Self::Configuration(message) | Self::Protocol(message) => f.write_str(message),
             Self::Transport(_) => {
                 f.write_str("OriginChainDB transport error; write outcome may be unknown")
@@ -296,6 +403,27 @@ pub struct SqlResult {
     pub raw: Value,
 }
 impl SqlResult {
+    /// Deserialize rows into application models with Serde. Raw values are kept
+    /// unchanged. Native Serde field and numeric validation rules apply.
+    ///
+    /// ```
+    /// # fn example(result: originchaindb::SqlResult) -> Result<(), originchaindb::RowDecodeError> {
+    /// #[derive(serde::Deserialize)]
+    /// struct Product { id: String, name: String }
+    /// let products: Vec<Product> = result.rows_as()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn rows_as<T: serde::de::DeserializeOwned>(&self) -> Result<Vec<T>, RowDecodeError> {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(row, value)| {
+                serde_json::from_value(Value::Object(value.clone()))
+                    .map_err(|source| RowDecodeError { row, source })
+            })
+            .collect()
+    }
     fn decode(value: Value) -> Result<Self, Error> {
         let mut normalized = value.clone();
         let object = normalized
